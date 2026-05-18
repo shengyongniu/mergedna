@@ -9,13 +9,13 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from mergedna.data import SyntheticDNADataset  # noqa: E402
+from mergedna.data import SequenceDataset, SyntheticDNADataset, read_sequences  # noqa: E402
 from mergedna.losses import mergedna_loss  # noqa: E402
 from mergedna.model import MergeDNAConfig, MergeDNAModel  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a tiny MergeDNA model on synthetic DNA.")
+    parser = argparse.ArgumentParser(description="Train a tiny MergeDNA model on DNA sequences.")
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=128)
@@ -23,13 +23,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--fasta",
+        type=Path,
+        default=None,
+        help="Optional path to a FASTA or plain-text DNA file. Falls back to synthetic data when absent.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
-    dataset = SyntheticDNADataset(num_sequences=max(args.steps * args.batch_size, 64), seq_len=args.seq_len)
+    if args.fasta is not None:
+        sequences = read_sequences(args.fasta, min_length=args.seq_len)
+        if not sequences:
+            raise SystemExit(f"No sequences with length >= {args.seq_len} in {args.fasta}")
+        dataset: torch.utils.data.Dataset = SequenceDataset(sequences, seq_len=args.seq_len)
+    else:
+        dataset = SyntheticDNADataset(
+            num_sequences=max(args.steps * args.batch_size, 64),
+            seq_len=args.seq_len,
+        )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
     config = MergeDNAConfig(
         max_seq_len=args.seq_len,
