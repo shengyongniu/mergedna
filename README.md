@@ -16,10 +16,19 @@ It is not a reproduction of the full paper run. The paper trains a roughly 380M 
 
 ## Install
 
+With a standard venv:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev,notebook]"
+```
+
+Or with `uv` (no venv setup required):
+
+```bash
+uv run --with pytest --with torch python -m pytest
+uv run python scripts/train_toy.py --steps 50
 ```
 
 On Colab, install the package from the notebook after cloning the repo.
@@ -28,6 +37,8 @@ On Colab, install the package from the notebook after cloning the repo.
 
 ```bash
 pytest
+# or
+uv run --with pytest --with torch python -m pytest
 ```
 
 ## Toy Training
@@ -42,7 +53,13 @@ For a GPU run:
 python scripts/train_toy.py --steps 200 --device cuda
 ```
 
-The toy dataset mixes random DNA with repeats and short motifs. It is only a smoke test that the architecture trains and gradients flow.
+To train on your own DNA file (FASTA or plain text):
+
+```bash
+python scripts/train_toy.py --fasta path/to/sequences.fa --steps 100
+```
+
+The synthetic dataset mixes random DNA with repeats and short motifs. It is only a smoke test that the architecture trains and gradients flow.
 
 ## Inspect Tokenization
 
@@ -65,6 +82,25 @@ This repo mirrors that flow:
 5. `losses.py`: exposes MTR, latent MTR, and AMTM-style losses.
 
 The merge code favors clarity over maximum throughput. Source groups are tracked as integer base-position lists, then expanded when needed for unmerge and masking.
+
+## Faithfulness Notes
+
+What this implementation matches:
+
+- Local Encoder with stacked local-window attention and source-tracked merging.
+- Latent Encoder runs at length L with one ToMe-style merge inside it, producing `(Z'_K, S')`.
+- The latent decoder runs on the unmerged-to-L tensor, as in the paper's Sec. 3.4.
+- Detached local encoder gradients on the latent MTR path (`L_MTR(theta \ {phi})`).
+- AMTM importance sampling with probability proportional to `1 / g_i^2` and AMTM loss normalized by `K`, the number of selected latent tokens (Eq. 7).
+- Per-step compression ratio jitter in the Local Encoder during training.
+- `lambda = 0.25` weighting on the latent MTR term.
+
+What is intentionally simpler:
+
+- Pair selection is a hard top-k by cosine similarity rather than the full DTEM grouping-embedding formulation.
+- One global merge inside the latent encoder rather than ToMe-style merging at every latent layer.
+- Plain learned positional embedding rather than LLaMA-style rotary embeddings.
+- Includes `N` in the base vocabulary to handle real DNA files; the paper uses `{A,C,G,T}` only.
 
 ## Out Of Scope
 
