@@ -61,6 +61,12 @@ python scripts/train_toy.py --fasta path/to/sequences.fa --steps 100
 
 The synthetic dataset mixes random DNA with repeats and short motifs. It is only a smoke test that the architecture trains and gradients flow.
 
+Useful flags for longer runs:
+
+- `--print-every 50` to throttle log output when training for many steps.
+- `--num-workers 2` to overlap FASTA decoding with the training step.
+- `--checkpoint path.pt` saves the model, config, and full per-step loss history. The `results.ipynb` notebook reads the history from this file.
+
 ## Inspect Tokenization
 
 ```bash
@@ -68,6 +74,24 @@ python scripts/inspect_tokenization.py
 ```
 
 This prints simple token-span statistics from the local merge stack. Repetitive regions should usually produce longer merged spans than noisier regions, though this prototype is intentionally small and not pretrained at paper scale.
+
+## Results
+
+The `notebooks/results.ipynb` notebook loads a checkpoint and produces the figures below from real model output. Re-run it with `--checkpoint checkpoints/your_run.pt` to refresh them after a longer training run.
+
+**Training losses.** All three objectives decrease together; AMTM starts higher because it is a summed cross-entropy over masked bases.
+
+![training losses](docs/loss_curve.png)
+
+**Per-sequence span distribution.** One merged token covers 1–4 bases. A fixed `k`-mer or BPE tokenizer would put all mass on a single bar; MergeDNA spreads it across span lengths in a content-dependent way.
+
+![span histogram](docs/span_histogram.png)
+
+**Span distribution by input content.** Same model applied to several inputs of equal length. The total token count is identical (the merge budget is fixed by `merge_ratio`); the shape of the distribution differs by content.
+
+![span by content](docs/span_by_content.png)
+
+The starter figures here come from a short prototype run. Differences between repetitive, random, and real DNA are visible but modest — pair selection is non-differentiable, so the merge-key projection only gets indirect signal, and convincing content-aware behaviour needs much more training on more diverse data than a single bacterial genome.
 
 ## How This Maps To The Paper
 

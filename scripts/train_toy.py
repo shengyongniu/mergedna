@@ -29,6 +29,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to a FASTA or plain-text DNA file. Falls back to synthetic data when absent.",
     )
+    parser.add_argument(
+        "--print-every",
+        type=int,
+        default=1,
+        help="Print loss every N steps. Loss history is still recorded for every step.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader worker processes. 0 keeps things simple; 2 helps when training on FASTA.",
+    )
     return parser.parse_args()
 
 
@@ -45,7 +57,13 @@ def main() -> None:
             num_sequences=max(args.steps * args.batch_size, 64),
             seq_len=args.seq_len,
         )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+    )
     config = MergeDNAConfig(
         max_seq_len=args.seq_len,
         d_model=args.d_model,
@@ -62,6 +80,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
     model.train()
+    history: list[dict[str, float]] = []
     step = 0
     while step < args.steps:
         for batch in loader:
@@ -72,17 +91,29 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             step += 1
-            print(
-                f"step {step:04d} total={losses.total.item():.4f} "
-                f"mtr={losses.mtr.item():.4f} latent={losses.latent_mtr.item():.4f} "
-                f"amtm={losses.amtm.item():.4f}"
-            )
+            entry = {
+                "step": step,
+                "total": losses.total.item(),
+                "mtr": losses.mtr.item(),
+                "latent_mtr": losses.latent_mtr.item(),
+                "amtm": losses.amtm.item(),
+            }
+            history.append(entry)
+            if step % args.print_every == 0 or step == args.steps:
+                print(
+                    f"step {step:04d} total={entry['total']:.4f} "
+                    f"mtr={entry['mtr']:.4f} latent={entry['latent_mtr']:.4f} "
+                    f"amtm={entry['amtm']:.4f}"
+                )
             if step >= args.steps:
                 break
 
     if args.checkpoint is not None:
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"config": config, "model": model.state_dict()}, args.checkpoint)
+        torch.save(
+            {"config": config, "model": model.state_dict(), "history": history},
+            args.checkpoint,
+        )
         print(f"saved {args.checkpoint}")
 
 

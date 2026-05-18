@@ -13,6 +13,22 @@ from mergedna.data import encode_dna, make_synthetic_dna  # noqa: E402
 from mergedna.model import MergeDNAConfig, MergeDNAModel  # noqa: E402
 
 
+def load_checkpoint(path: Path) -> dict:
+    """Load a checkpoint whose payload includes the MergeDNAConfig dataclass.
+
+    PyTorch 2.6 flipped the default to weights_only=True, which refuses to
+    unpickle arbitrary classes. We allowlist just MergeDNAConfig instead of
+    disabling the safety check globally.
+    """
+    try:
+        from torch.serialization import safe_globals
+        with safe_globals([MergeDNAConfig]):
+            return torch.load(path, map_location="cpu")
+    except (ImportError, AttributeError):
+        # Older PyTorch without safe_globals: original behaviour is fine.
+        return torch.load(path, map_location="cpu")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Inspect MergeDNA local token spans.")
     parser.add_argument("--seq-len", type=int, default=128)
@@ -27,7 +43,7 @@ def main() -> None:
     config = MergeDNAConfig(max_seq_len=args.seq_len, d_model=args.d_model, merge_ratio=0.20)
     model = MergeDNAModel(config)
     if args.checkpoint is not None:
-        payload = torch.load(args.checkpoint, map_location="cpu")
+        payload = load_checkpoint(args.checkpoint)
         if "config" in payload:
             config = payload["config"]
             model = MergeDNAModel(config)
