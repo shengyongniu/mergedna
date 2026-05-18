@@ -39,3 +39,33 @@ def test_adaptive_mask_expands_to_source_bases() -> None:
     base_mask = expand_local_mask_to_bases(local_mask, [[[0, 1], [2], [3, 4]]], seq_len=5)
     assert base_mask.shape == (1, 5)
     assert int(base_mask.sum()) in {1, 2}
+
+
+def test_merge_unmerge_identity_on_equal_rows() -> None:
+    tokens = torch.tensor(
+        [
+            [
+                [1.0, 2.0],
+                [1.0, 2.0],
+                [-3.0, 4.0],
+                [-3.0, 4.0],
+            ]
+        ]
+    )
+    sources = initial_sources(1, 4)
+    merged = apply_merge_pairs(tokens, sources, [[(0, 1), (2, 3)]])
+    restored = unmerge_tokens(merged.tokens, merged.sources, seq_len=4)
+    assert torch.allclose(restored, tokens)
+
+
+def test_adaptive_mask_biases_singleton() -> None:
+    group_map = [[0, 1, 1, 1, 1]]
+    latent_lengths = [2]
+    counts = torch.zeros(5, dtype=torch.long)
+    generator = torch.Generator().manual_seed(0)
+    for _ in range(400):
+        sample = sample_adaptive_local_masks(
+            group_map, latent_lengths, num_masks=1, generator=generator
+        )
+        counts += sample[0].long()
+    assert counts[0] > counts[1:].max()

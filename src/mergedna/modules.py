@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mergedna.merge import SourceGroups, global_merge_tokens, initial_sources
+from mergedna.merge import SourceGroups, global_merge_tokens, initial_sources, sources_valid_mask
 
 
 class LearnedPositionEmbedding(nn.Module):
@@ -60,6 +60,8 @@ class TransformerBlock(nn.Module):
         if self.local_window is not None:
             attn_mask = local_attention_mask(x.size(1), self.local_window, x.device)
         h = self.norm1(x)
+        if key_padding_mask is not None:
+            h = h.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
         attn_out, _ = self.attn(
             h,
             h,
@@ -68,6 +70,7 @@ class TransformerBlock(nn.Module):
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
+        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=0.0, neginf=0.0)
         x = x + attn_out
         return x + self.mlp(self.norm2(x))
 
@@ -155,11 +158,10 @@ class LatentEncoder(nn.Module):
         kpm = key_padding_mask
         for layer_idx, layer in enumerate(self.layers):
             if latent_sources is None and layer_idx == self.merge_at_layer:
-                x, latent_sources, group_map = self._merge(x, target_tokens, kpm)
-                kpm = None
+                x, latent_sources, group_map, kpm = self._merge(x, target_tokens, kpm)
             x = layer(x, key_padding_mask=kpm)
         if latent_sources is None:
-            x, latent_sources, group_map = self._merge(x, target_tokens, kpm)
+            x, latent_sources, group_map, _ = self._merge(x, target_tokens, kpm)
         return self.norm(x), latent_sources, group_map or []
 
     @staticmethod
@@ -167,8 +169,13 @@ class LatentEncoder(nn.Module):
         x: torch.Tensor,
         target_tokens: int,
         key_padding_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, SourceGroups, list[list[int]]]:
+    ) -> tuple[torch.Tensor, SourceGroups, list[list[int]], torch.Tensor | None]:
         sources = initial_sources(x.size(0), x.size(1))
         valid = (~key_padding_mask) if key_padding_mask is not None else None
         out = global_merge_tokens(x, sources, target_tokens=target_tokens, valid_mask=valid)
-        return out.tokens, out.sources, out.group_map or []
+        new_kpm: torch.Tensor | None = None
+        if valid is not None:
+            merged_valid = sources_valid_mask(out.sources, valid).to(x.device)
+            if not bool(merged_valid.all()):
+                new_kpm = ~merged_valid
+        return out.tokens, out.sources, out.group_map or [], new_kpm
