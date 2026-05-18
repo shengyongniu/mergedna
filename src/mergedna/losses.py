@@ -23,13 +23,17 @@ def reconstruction_loss(
     *,
     mask: torch.Tensor | None = None,
     ignore_index: int = PAD_ID,
+    normalize_by: int | None = None,
 ) -> torch.Tensor:
     if mask is not None:
         if not bool(mask.any()):
             return logits.sum() * 0.0
-        logits = logits[mask]
-        targets = targets[mask]
-        return F.cross_entropy(logits, targets)
+        masked_logits = logits[mask]
+        masked_targets = targets[mask]
+        if normalize_by is not None:
+            total = F.cross_entropy(masked_logits, masked_targets, reduction="sum")
+            return total / max(normalize_by, 1)
+        return F.cross_entropy(masked_logits, masked_targets)
     return F.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
         targets.reshape(-1),
@@ -48,8 +52,14 @@ def latent_mtr_loss(model: MergeDNAModel, input_ids: torch.Tensor) -> torch.Tens
 
 
 def amtm_loss(model: MergeDNAModel, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    output, base_mask, _ = model.forward_amtm(input_ids)
-    return reconstruction_loss(output.logits, input_ids, mask=base_mask), base_mask
+    output, base_mask, num_selected = model.forward_amtm(input_ids)
+    loss = reconstruction_loss(
+        output.logits,
+        input_ids,
+        mask=base_mask,
+        normalize_by=num_selected,
+    )
+    return loss, base_mask
 
 
 def mergedna_loss(
