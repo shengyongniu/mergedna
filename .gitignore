@@ -8,10 +8,16 @@ __pycache__/
 venv/
 dist/
 build/
-checkpoints/
 runs/
-data/
+.DS_Store
+
+# Ignore checkpoints and data by default; whitelist the small reference
+# artifacts that ship with the repo so the README figures and the
+# inspect/results notebooks are reproducible after a fresh clone.
+checkpoints/*
+data/*
 *.pt
 *.pth
 *.ckpt
-.DS_Store
+!checkpoints/ecoli.pt
+!data/ecoli_k12_cds.fa
