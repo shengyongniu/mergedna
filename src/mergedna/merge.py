@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -24,37 +25,56 @@ def source_lengths(sources: SourceGroups, *, device: torch.device | None = None)
     return torch.tensor(lengths, dtype=torch.float32, device=device)
 
 
+def _base_to_token_index(
+    sources: SourceGroups, seq_len: int, device: torch.device
+) -> torch.Tensor:
+    """For each base position, the index of the merged token that contains it.
+
+    Used to convert per-group operations into single gather/scatter calls.
+    Assumes every base in [0, seq_len) appears in exactly one group.
+    """
+    idx = [[0] * seq_len for _ in range(len(sources))]
+    for batch_idx, batch_sources in enumerate(sources):
+        row = idx[batch_idx]
+        for token_idx, group in enumerate(batch_sources):
+            for base in group:
+                row[base] = token_idx
+    return torch.tensor(idx, dtype=torch.long, device=device)
+
+
 def sources_to_mask(sources: SourceGroups, seq_len: int, *, device: torch.device | None = None) -> torch.Tensor:
     batch_size = len(sources)
     max_tokens = max(len(batch_sources) for batch_sources in sources)
-    mask = torch.zeros(batch_size, max_tokens, seq_len, dtype=torch.bool, device=device)
-    for batch_idx, batch_sources in enumerate(sources):
-        for token_idx, group in enumerate(batch_sources):
-            mask[batch_idx, token_idx, group] = True
+    base_to_token = _base_to_token_index(sources, seq_len, device or torch.device("cpu"))
+    mask = torch.zeros(batch_size, max_tokens, seq_len, dtype=torch.bool, device=base_to_token.device)
+    arange_b = torch.arange(batch_size, device=base_to_token.device).unsqueeze(-1).expand(batch_size, seq_len)
+    arange_s = torch.arange(seq_len, device=base_to_token.device).unsqueeze(0).expand(batch_size, seq_len)
+    mask[arange_b, base_to_token, arange_s] = True
     return mask
 
 
 def sources_valid_mask(sources: SourceGroups, base_valid: torch.Tensor) -> torch.Tensor:
     """Per-merged-token validity: True if any source base is valid."""
-    batch_size = base_valid.size(0)
+    batch_size, seq_len = base_valid.shape
     max_tokens = max(len(batch_sources) for batch_sources in sources)
-    valid = torch.zeros(batch_size, max_tokens, dtype=torch.bool, device=base_valid.device)
-    for batch_idx, batch_sources in enumerate(sources):
-        for token_idx, group in enumerate(batch_sources):
-            valid[batch_idx, token_idx] = bool(base_valid[batch_idx, group].any())
-    return valid
+    base_to_token = _base_to_token_index(sources, seq_len, base_valid.device)
+    counts = torch.zeros(batch_size, max_tokens, dtype=torch.long, device=base_valid.device)
+    counts.scatter_add_(1, base_to_token, base_valid.long())
+    return counts > 0
 
 
-def _window_pair_candidates(length: int, window_size: int, radius: int) -> list[tuple[int, int]]:
+@lru_cache(maxsize=32)
+def _window_pair_candidates(length: int, window_size: int, radius: int) -> tuple[tuple[int, int], ...]:
     pairs: list[tuple[int, int]] = []
     for start in range(0, length, window_size):
         end = min(start + window_size, length)
         for left in range(start, end):
             for right in range(left + 1, min(end, left + radius + 1)):
                 pairs.append((left, right))
-    return pairs
+    return tuple(pairs)
 
 
+@torch.no_grad()
 def select_merge_pairs(
     tokens: torch.Tensor,
     *,
@@ -63,7 +83,12 @@ def select_merge_pairs(
     neighbor_radius: int = 1,
     valid_mask: torch.Tensor | None = None,
 ) -> list[list[tuple[int, int]]]:
-    """Select non-overlapping similar pairs per batch item."""
+    """Select non-overlapping similar pairs per batch item.
+
+    Computes all candidate similarities in one batched matmul, then runs the
+    greedy non-overlapping pick on CPU (one device sync per call instead of
+    one per candidate).
+    """
     if tokens.ndim != 3:
         raise ValueError("tokens must have shape [batch, length, dim]")
     batch_size, length, _ = tokens.shape
@@ -75,30 +100,43 @@ def select_merge_pairs(
     if not candidates:
         return [[] for _ in range(batch_size)]
 
+    cand = torch.tensor(candidates, dtype=torch.long, device=tokens.device)
+    left_idx = cand[:, 0]
+    right_idx = cand[:, 1]
+
     normalized = F.normalize(tokens, dim=-1)
+    left_tokens = normalized.index_select(1, left_idx)
+    right_tokens = normalized.index_select(1, right_idx)
+    sim = (left_tokens * right_tokens).sum(-1)
+
+    if valid_mask is not None:
+        lv = valid_mask.index_select(1, left_idx)
+        rv = valid_mask.index_select(1, right_idx)
+        sim = sim.masked_fill(lv != rv, float("-inf"))
+
+    order = sim.argsort(dim=-1, descending=True).cpu().numpy()
+    left_arr = left_idx.cpu().numpy()
+    right_arr = right_idx.cpu().numpy()
+    sim_cpu = sim.cpu().numpy() if valid_mask is not None else None
+
     pairs_by_batch: list[list[tuple[int, int]]] = []
     for batch_idx in range(batch_size):
-        scored: list[tuple[float, int, int]] = []
-        for left, right in candidates:
-            if valid_mask is not None:
-                left_valid = bool(valid_mask[batch_idx, left])
-                right_valid = bool(valid_mask[batch_idx, right])
-                if left_valid != right_valid:
-                    continue
-            score = torch.dot(normalized[batch_idx, left], normalized[batch_idx, right]).item()
-            scored.append((score, left, right))
-        scored.sort(reverse=True)
-        used: set[int] = set()
+        used = bytearray(length)
         selected: list[tuple[int, int]] = []
-        for _, left, right in scored:
-            if left in used or right in used:
+        for s in order[batch_idx]:
+            if sim_cpu is not None and sim_cpu[batch_idx, s] == float("-inf"):
+                break
+            l = int(left_arr[s])
+            r = int(right_arr[s])
+            if used[l] or used[r]:
                 continue
-            selected.append((left, right))
-            used.add(left)
-            used.add(right)
+            selected.append((l, r))
+            used[l] = 1
+            used[r] = 1
             if len(selected) >= target_pairs:
                 break
-        pairs_by_batch.append(sorted(selected))
+        selected.sort()
+        pairs_by_batch.append(selected)
     return pairs_by_batch
 
 
@@ -107,6 +145,14 @@ def apply_merge_pairs(
     sources: SourceGroups,
     pairs_by_batch: list[list[tuple[int, int]]],
 ) -> MergeOutput:
+    """Combine merged pairs with span-weighted averages.
+
+    For each batch we build (primary, secondary, weights) index tensors and
+    perform a single gather + weighted sum instead of one scalar op per token.
+    """
+    batch_size, length, dim = tokens.shape
+    device = tokens.device
+
     merged_batches: list[torch.Tensor] = []
     merged_sources: SourceGroups = []
     group_maps: list[list[int]] = []
@@ -115,35 +161,47 @@ def apply_merge_pairs(
         left_to_right: dict[int, int] = {left: right for left, right in pairs}
         right_to_left: dict[int, int] = {right: left for left, right in pairs}
         source_batch = sources[batch_idx]
-        length = tokens.size(1)
-        new_tokens: list[torch.Tensor] = []
+
+        primary: list[int] = []
+        secondary: list[int] = []
+        primary_w: list[float] = []
+        secondary_w: list[float] = []
         new_sources: list[list[int]] = []
         group_map: list[int] = [-1] * length
 
         for idx in range(length):
             if idx in right_to_left:
                 continue
-            out_idx = len(new_tokens)
+            out_idx = len(primary)
             if idx in left_to_right:
                 right = left_to_right[idx]
-                left_weight = len(source_batch[idx])
-                right_weight = len(source_batch[right])
-                total = left_weight + right_weight
-                token = (
-                    tokens[batch_idx, idx] * left_weight
-                    + tokens[batch_idx, right] * right_weight
-                ) / total
-                group = sorted(source_batch[idx] + source_batch[right])
+                lw = len(source_batch[idx])
+                rw = len(source_batch[right])
+                total = lw + rw
+                primary.append(idx)
+                secondary.append(right)
+                primary_w.append(lw / total)
+                secondary_w.append(rw / total)
                 group_map[idx] = out_idx
                 group_map[right] = out_idx
+                new_sources.append(sorted(source_batch[idx] + source_batch[right]))
             else:
-                token = tokens[batch_idx, idx]
-                group = list(source_batch[idx])
+                primary.append(idx)
+                secondary.append(idx)
+                primary_w.append(1.0)
+                secondary_w.append(0.0)
                 group_map[idx] = out_idx
-            new_tokens.append(token)
-            new_sources.append(group)
+                new_sources.append(list(source_batch[idx]))
 
-        merged_batches.append(torch.stack(new_tokens, dim=0))
+        p_idx = torch.tensor(primary, dtype=torch.long, device=device)
+        s_idx = torch.tensor(secondary, dtype=torch.long, device=device)
+        pw = torch.tensor(primary_w, dtype=tokens.dtype, device=device).unsqueeze(-1)
+        sw = torch.tensor(secondary_w, dtype=tokens.dtype, device=device).unsqueeze(-1)
+
+        row = tokens[batch_idx]
+        new_tokens = row.index_select(0, p_idx) * pw + row.index_select(0, s_idx) * sw
+
+        merged_batches.append(new_tokens)
         merged_sources.append(new_sources)
         group_maps.append(group_map)
 
@@ -171,12 +229,11 @@ def merge_tokens(
 
 
 def unmerge_tokens(tokens: torch.Tensor, sources: SourceGroups, seq_len: int) -> torch.Tensor:
+    """Broadcast each merged token back to all of its source base positions."""
     batch_size, _, dim = tokens.shape
-    restored = tokens.new_zeros(batch_size, seq_len, dim)
-    for batch_idx, batch_sources in enumerate(sources):
-        for token_idx, group in enumerate(batch_sources):
-            restored[batch_idx, group] = tokens[batch_idx, token_idx]
-    return restored
+    base_to_token = _base_to_token_index(sources, seq_len, tokens.device)
+    expanded = base_to_token.unsqueeze(-1).expand(batch_size, seq_len, dim)
+    return tokens.gather(1, expanded)
 
 
 def global_merge_tokens(
@@ -204,15 +261,16 @@ def global_merge_tokens(
 def latent_importance_weights(group_map: list[list[int]], latent_lengths: list[int]) -> list[torch.Tensor]:
     weights: list[torch.Tensor] = []
     for batch_map, latent_len in zip(group_map, latent_lengths, strict=True):
-        counts = torch.zeros(latent_len, dtype=torch.float32)
-        for latent_idx in batch_map:
-            if latent_idx >= 0:
-                counts[latent_idx] += 1
-        local_weights = torch.empty(len(batch_map), dtype=torch.float32)
-        for local_idx, latent_idx in enumerate(batch_map):
-            size = counts[latent_idx].clamp_min(1.0)
-            local_weights[local_idx] = 1.0 / (size * size)
-        weights.append(local_weights / local_weights.sum().clamp_min(1e-8))
+        bm = torch.tensor(batch_map, dtype=torch.long)
+        # Per-merged-token count; -1 sentinels (shouldn't appear in practice) route to a dummy slot.
+        valid = bm >= 0
+        counts = torch.zeros(max(latent_len, 1), dtype=torch.float32)
+        if valid.any():
+            counts.scatter_add_(0, bm[valid], torch.ones(int(valid.sum()), dtype=torch.float32))
+        safe = torch.where(valid, bm, torch.full_like(bm, latent_len - 1))
+        sizes = counts[safe].clamp_min(1.0)
+        local = 1.0 / (sizes * sizes)
+        weights.append(local / local.sum().clamp_min(1e-8))
     return weights
 
 
@@ -234,9 +292,5 @@ def sample_adaptive_local_masks(
 
 
 def expand_local_mask_to_bases(local_mask: torch.Tensor, sources: SourceGroups, seq_len: int) -> torch.Tensor:
-    base_mask = torch.zeros(local_mask.size(0), seq_len, dtype=torch.bool, device=local_mask.device)
-    for batch_idx, batch_sources in enumerate(sources):
-        for token_idx, group in enumerate(batch_sources):
-            if bool(local_mask[batch_idx, token_idx]):
-                base_mask[batch_idx, group] = True
-    return base_mask
+    base_to_token = _base_to_token_index(sources, seq_len, local_mask.device)
+    return local_mask.gather(1, base_to_token)
