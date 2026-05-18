@@ -10,13 +10,17 @@ from mergedna.merge import (
     SourceGroups,
     apply_merge_pairs,
     expand_local_mask_to_bases,
-    global_merge_tokens,
     initial_sources,
     sample_adaptive_local_masks,
     select_merge_pairs,
     unmerge_tokens,
 )
-from mergedna.modules import LearnedPositionEmbedding, TransformerBlock, TransformerStack
+from mergedna.modules import (
+    LatentEncoder,
+    LearnedPositionEmbedding,
+    TransformerBlock,
+    TransformerStack,
+)
 
 
 @dataclass
@@ -32,6 +36,7 @@ class MergeDNAConfig:
     local_window: int = 16
     merge_ratio: float = 0.25
     latent_merge_ratio: float = 0.5
+    latent_merge_at_layer: int | None = None
     neighbor_radius: int = 1
     dropout: float = 0.0
     mask_token_id: int = MASK_ID
@@ -102,11 +107,12 @@ class MergeDNAModel(nn.Module):
         super().__init__()
         self.config = config or MergeDNAConfig()
         self.local_encoder = LocalEncoder(self.config)
-        self.latent_encoder = TransformerStack(
+        self.latent_encoder = LatentEncoder(
             self.config.latent_layers,
             self.config.d_model,
             self.config.num_heads,
             dropout=self.config.dropout,
+            merge_at_layer=self.config.latent_merge_at_layer,
         )
         self.latent_decoder = TransformerStack(
             self.config.latent_decoder_layers,
@@ -139,10 +145,8 @@ class MergeDNAModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         latent = self.latent_encoder(local_tokens)
         decoded_local = self.latent_decoder(latent)
-        base_repr = unmerge_tokens(decoded_local, sources, seq_len)
-        base_repr = self.base_position(base_repr)
-        base_repr = self.local_decoder(base_repr)
-        return self.output(base_repr), latent, base_repr
+        logits, base_repr = self.logits_from_decoded_local(decoded_local, sources, seq_len)
+        return logits, latent, base_repr
 
     def logits_from_decoded_local(
         self,
@@ -178,14 +182,16 @@ class MergeDNAModel(nn.Module):
     ) -> tuple[ReconstructionOutput, LatentMergeInfo]:
         local = self.encode_local(input_ids)
         local_tokens = local.tokens.detach() if detach_local else local.tokens
-        token_sources = initial_sources(input_ids.size(0), local_tokens.size(1))
-        target_tokens = max(1, int(local_tokens.size(1) * (1.0 - self.config.latent_merge_ratio)))
-        merged = global_merge_tokens(local_tokens, token_sources, target_tokens=target_tokens)
-        latent = self.latent_encoder(merged.tokens)
-        decoded_latent = self.latent_decoder(latent)
-        reconstructed_local = unmerge_tokens(decoded_latent, merged.sources, local_tokens.size(1))
+        local_len = local_tokens.size(1)
+        target_tokens = max(1, int(local_len * (1.0 - self.config.latent_merge_ratio)))
+        compressed, latent_sources, group_map = self.latent_encoder.forward_with_merge(
+            local_tokens,
+            target_tokens=target_tokens,
+        )
+        unmerged_to_L = unmerge_tokens(compressed, latent_sources, local_len)
+        decoded_local = self.latent_decoder(unmerged_to_L)
         logits, base_repr = self.logits_from_decoded_local(
-            reconstructed_local,
+            decoded_local,
             local.sources,
             input_ids.size(1),
         )
@@ -193,34 +199,37 @@ class MergeDNAModel(nn.Module):
             logits=logits,
             local_tokens=local_tokens,
             local_sources=local.sources,
-            latent_tokens=latent,
+            latent_tokens=compressed,
             base_representations=base_repr,
         )
         info = LatentMergeInfo(
-            compressed_tokens=merged.tokens,
-            reconstructed_local_tokens=reconstructed_local,
-            group_map=merged.group_map or [],
-            latent_lengths=[len(batch_sources) for batch_sources in merged.sources],
+            compressed_tokens=compressed,
+            reconstructed_local_tokens=unmerged_to_L,
+            group_map=group_map,
+            latent_lengths=[len(batch_sources) for batch_sources in latent_sources],
         )
         return output, info
 
-    def make_adaptive_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def make_adaptive_mask(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, int]:
         with torch.no_grad():
             local = self.encode_local(input_ids)
-            token_sources = initial_sources(input_ids.size(0), local.tokens.size(1))
-            target_tokens = max(1, int(local.tokens.size(1) * (1.0 - self.config.latent_merge_ratio)))
-            merged = global_merge_tokens(local.tokens, token_sources, target_tokens=target_tokens)
-            group_map = merged.group_map or []
-            latent_lengths = [len(batch_sources) for batch_sources in merged.sources]
+            local_len = local.tokens.size(1)
+            target_tokens = max(1, int(local_len * (1.0 - self.config.latent_merge_ratio)))
+            _, latent_sources, group_map = self.latent_encoder.forward_with_merge(
+                local.tokens,
+                target_tokens=target_tokens,
+            )
+            latent_lengths = [len(batch_sources) for batch_sources in latent_sources]
             num_masks = max(1, target_tokens)
             local_mask = sample_adaptive_local_masks(
                 group_map,
                 latent_lengths,
                 num_masks=num_masks,
             ).to(input_ids.device)
-            return expand_local_mask_to_bases(local_mask, local.sources, input_ids.size(1))
+            base_mask = expand_local_mask_to_bases(local_mask, local.sources, input_ids.size(1))
+            return base_mask, num_masks
 
-    def forward_amtm(self, input_ids: torch.Tensor) -> tuple[ReconstructionOutput, torch.Tensor]:
-        base_mask = self.make_adaptive_mask(input_ids)
+    def forward_amtm(self, input_ids: torch.Tensor) -> tuple[ReconstructionOutput, torch.Tensor, int]:
+        base_mask, num_selected = self.make_adaptive_mask(input_ids)
         masked_ids = input_ids.masked_fill(base_mask, self.config.mask_token_id)
-        return self.forward(masked_ids), base_mask
+        return self.forward(masked_ids), base_mask, num_selected

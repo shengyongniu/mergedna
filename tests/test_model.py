@@ -32,10 +32,11 @@ def test_model_forward_shapes() -> None:
 def test_amtm_mask_maps_to_bases() -> None:
     batch = torch.stack([SyntheticDNADataset(num_sequences=1, seq_len=32)[0] for _ in range(2)])
     model = MergeDNAModel(small_config())
-    output, mask = model.forward_amtm(batch)
+    output, mask, num_selected = model.forward_amtm(batch)
     assert output.logits.shape[:2] == batch.shape
     assert mask.shape == batch.shape
     assert mask.any()
+    assert num_selected >= 1
 
 
 def test_tiny_forward_backward_has_finite_loss() -> None:

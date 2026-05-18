@@ -48,7 +48,7 @@ def latent_mtr_loss(model: MergeDNAModel, input_ids: torch.Tensor) -> torch.Tens
 
 
 def amtm_loss(model: MergeDNAModel, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    output, base_mask = model.forward_amtm(input_ids)
+    output, base_mask, _ = model.forward_amtm(input_ids)
     return reconstruction_loss(output.logits, input_ids, mask=base_mask), base_mask
 
 
