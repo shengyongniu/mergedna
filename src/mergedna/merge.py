@@ -34,6 +34,17 @@ def sources_to_mask(sources: SourceGroups, seq_len: int, *, device: torch.device
     return mask
 
 
+def sources_valid_mask(sources: SourceGroups, base_valid: torch.Tensor) -> torch.Tensor:
+    """Per-merged-token validity: True if any source base is valid."""
+    batch_size = base_valid.size(0)
+    max_tokens = max(len(batch_sources) for batch_sources in sources)
+    valid = torch.zeros(batch_size, max_tokens, dtype=torch.bool, device=base_valid.device)
+    for batch_idx, batch_sources in enumerate(sources):
+        for token_idx, group in enumerate(batch_sources):
+            valid[batch_idx, token_idx] = bool(base_valid[batch_idx, group].any())
+    return valid
+
+
 def _window_pair_candidates(length: int, window_size: int, radius: int) -> list[tuple[int, int]]:
     pairs: list[tuple[int, int]] = []
     for start in range(0, length, window_size):
@@ -50,6 +61,7 @@ def select_merge_pairs(
     window_size: int,
     merge_ratio: float,
     neighbor_radius: int = 1,
+    valid_mask: torch.Tensor | None = None,
 ) -> list[list[tuple[int, int]]]:
     """Select non-overlapping similar pairs per batch item."""
     if tokens.ndim != 3:
@@ -68,6 +80,11 @@ def select_merge_pairs(
     for batch_idx in range(batch_size):
         scored: list[tuple[float, int, int]] = []
         for left, right in candidates:
+            if valid_mask is not None:
+                left_valid = bool(valid_mask[batch_idx, left])
+                right_valid = bool(valid_mask[batch_idx, right])
+                if left_valid != right_valid:
+                    continue
             score = torch.dot(normalized[batch_idx, left], normalized[batch_idx, right]).item()
             scored.append((score, left, right))
         scored.sort(reverse=True)
@@ -138,12 +155,14 @@ def merge_tokens(
     window_size: int,
     merge_ratio: float,
     neighbor_radius: int = 1,
+    valid_mask: torch.Tensor | None = None,
 ) -> MergeOutput:
     pairs = select_merge_pairs(
         tokens,
         window_size=window_size,
         merge_ratio=merge_ratio,
         neighbor_radius=neighbor_radius,
+        valid_mask=valid_mask,
     )
     return apply_merge_pairs(tokens, sources, pairs)
 
@@ -157,7 +176,13 @@ def unmerge_tokens(tokens: torch.Tensor, sources: SourceGroups, seq_len: int) ->
     return restored
 
 
-def global_merge_tokens(tokens: torch.Tensor, sources: SourceGroups, target_tokens: int) -> MergeOutput:
+def global_merge_tokens(
+    tokens: torch.Tensor,
+    sources: SourceGroups,
+    target_tokens: int,
+    *,
+    valid_mask: torch.Tensor | None = None,
+) -> MergeOutput:
     length = tokens.size(1)
     if target_tokens >= length:
         group_map = [[idx for idx in range(length)] for _ in range(tokens.size(0))]
@@ -169,6 +194,7 @@ def global_merge_tokens(tokens: torch.Tensor, sources: SourceGroups, target_toke
         window_size=length,
         merge_ratio=merge_ratio,
         neighbor_radius=length,
+        valid_mask=valid_mask,
     )
 
 

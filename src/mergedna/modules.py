@@ -155,17 +155,20 @@ class LatentEncoder(nn.Module):
         kpm = key_padding_mask
         for layer_idx, layer in enumerate(self.layers):
             if latent_sources is None and layer_idx == self.merge_at_layer:
-                x, latent_sources, group_map = self._merge(x, target_tokens)
+                x, latent_sources, group_map = self._merge(x, target_tokens, kpm)
                 kpm = None
             x = layer(x, key_padding_mask=kpm)
         if latent_sources is None:
-            x, latent_sources, group_map = self._merge(x, target_tokens)
+            x, latent_sources, group_map = self._merge(x, target_tokens, kpm)
         return self.norm(x), latent_sources, group_map or []
 
     @staticmethod
     def _merge(
-        x: torch.Tensor, target_tokens: int
+        x: torch.Tensor,
+        target_tokens: int,
+        key_padding_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, SourceGroups, list[list[int]]]:
         sources = initial_sources(x.size(0), x.size(1))
-        out = global_merge_tokens(x, sources, target_tokens=target_tokens)
+        valid = (~key_padding_mask) if key_padding_mask is not None else None
+        out = global_merge_tokens(x, sources, target_tokens=target_tokens, valid_mask=valid)
         return out.tokens, out.sources, out.group_map or []

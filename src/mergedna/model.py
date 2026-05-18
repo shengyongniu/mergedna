@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from mergedna.data import MASK_ID, VOCAB_SIZE
+from mergedna.data import MASK_ID, PAD_ID, VOCAB_SIZE
 from mergedna.merge import (
     SourceGroups,
     apply_merge_pairs,
@@ -13,6 +13,7 @@ from mergedna.merge import (
     initial_sources,
     sample_adaptive_local_masks,
     select_merge_pairs,
+    sources_valid_mask,
     unmerge_tokens,
 )
 from mergedna.modules import (
@@ -49,6 +50,7 @@ class MergeDNAConfig:
 class LocalEncoding:
     tokens: torch.Tensor
     sources: SourceGroups
+    valid_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -98,22 +100,36 @@ class LocalEncoder(nn.Module):
         ).item()
         return float(min(max(sample, cfg.merge_ratio_min), cfg.merge_ratio_max))
 
-    def forward(self, input_ids: torch.Tensor) -> LocalEncoding:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> LocalEncoding:
         x = self.position(self.embedding(input_ids))
         sources = initial_sources(input_ids.size(0), input_ids.size(1))
+        base_valid = (
+            ~key_padding_mask
+            if key_padding_mask is not None
+            else torch.ones_like(input_ids, dtype=torch.bool)
+        )
+        token_valid = base_valid
         for layer in self.layers:
-            x = layer(x)
+            attn_pad = (~token_valid) if not bool(token_valid.all()) else None
+            x = layer(x, key_padding_mask=attn_pad)
             merge_ratio = self._sample_merge_ratio()
             pairs = select_merge_pairs(
                 self.merge_key(x),
                 window_size=self.config.local_window,
                 merge_ratio=merge_ratio,
                 neighbor_radius=self.config.neighbor_radius,
+                valid_mask=token_valid,
             )
             merge_out = apply_merge_pairs(x, sources, pairs)
             x = merge_out.tokens
             sources = merge_out.sources
-        return LocalEncoding(tokens=self.norm(x), sources=sources)
+            token_valid = sources_valid_mask(sources, base_valid).to(x.device)
+        return LocalEncoding(tokens=self.norm(x), sources=sources, valid_mask=token_valid)
 
 
 class MergeDNAModel(nn.Module):
@@ -144,22 +160,39 @@ class MergeDNAModel(nn.Module):
         self.base_position = LearnedPositionEmbedding(self.config.max_seq_len, self.config.d_model)
         self.output = nn.Linear(self.config.d_model, self.config.vocab_size)
 
-    def encode_local(self, input_ids: torch.Tensor) -> LocalEncoding:
-        return self.local_encoder(input_ids)
+    @staticmethod
+    def _pad_mask(input_ids: torch.Tensor) -> torch.Tensor | None:
+        mask = input_ids == PAD_ID
+        return mask if bool(mask.any()) else None
+
+    def encode_local(
+        self, input_ids: torch.Tensor, *, key_padding_mask: torch.Tensor | None = None
+    ) -> LocalEncoding:
+        if key_padding_mask is None:
+            key_padding_mask = self._pad_mask(input_ids)
+        return self.local_encoder(input_ids, key_padding_mask=key_padding_mask)
 
     def encode_representation(self, input_ids: torch.Tensor) -> torch.Tensor:
         local = self.encode_local(input_ids)
-        return self.latent_encoder(local.tokens)
+        latent_pad = (~local.valid_mask) if local.valid_mask is not None else None
+        if latent_pad is not None and not bool(latent_pad.any()):
+            latent_pad = None
+        return self.latent_encoder(local.tokens, key_padding_mask=latent_pad)
 
     def decode_from_local_tokens(
         self,
         local_tokens: torch.Tensor,
         sources: SourceGroups,
         seq_len: int,
+        *,
+        latent_padding_mask: torch.Tensor | None = None,
+        base_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        latent = self.latent_encoder(local_tokens)
-        decoded_local = self.latent_decoder(latent)
-        logits, base_repr = self.logits_from_decoded_local(decoded_local, sources, seq_len)
+        latent = self.latent_encoder(local_tokens, key_padding_mask=latent_padding_mask)
+        decoded_local = self.latent_decoder(latent, key_padding_mask=latent_padding_mask)
+        logits, base_repr = self.logits_from_decoded_local(
+            decoded_local, sources, seq_len, base_padding_mask=base_padding_mask
+        )
         return logits, latent, base_repr
 
     def logits_from_decoded_local(
@@ -167,18 +200,24 @@ class MergeDNAModel(nn.Module):
         decoded_local: torch.Tensor,
         sources: SourceGroups,
         seq_len: int,
+        *,
+        base_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         base_repr = unmerge_tokens(decoded_local, sources, seq_len)
         base_repr = self.base_position(base_repr)
-        base_repr = self.local_decoder(base_repr)
+        base_repr = self.local_decoder(base_repr, key_padding_mask=base_padding_mask)
         return self.output(base_repr), base_repr
 
     def forward(self, input_ids: torch.Tensor) -> ReconstructionOutput:
-        local = self.encode_local(input_ids)
+        base_pad = self._pad_mask(input_ids)
+        local = self.encode_local(input_ids, key_padding_mask=base_pad)
+        latent_pad = self._latent_pad_from_local(local)
         logits, latent, base_repr = self.decode_from_local_tokens(
             local.tokens,
             local.sources,
             input_ids.size(1),
+            latent_padding_mask=latent_pad,
+            base_padding_mask=base_pad,
         )
         return ReconstructionOutput(
             logits=logits,
@@ -188,26 +227,37 @@ class MergeDNAModel(nn.Module):
             base_representations=base_repr,
         )
 
+    @staticmethod
+    def _latent_pad_from_local(local: LocalEncoding) -> torch.Tensor | None:
+        if local.valid_mask is None:
+            return None
+        pad = ~local.valid_mask
+        return pad if bool(pad.any()) else None
+
     def latent_merge_reconstruction(
         self,
         input_ids: torch.Tensor,
         *,
         detach_local: bool = True,
     ) -> tuple[ReconstructionOutput, LatentMergeInfo]:
-        local = self.encode_local(input_ids)
+        base_pad = self._pad_mask(input_ids)
+        local = self.encode_local(input_ids, key_padding_mask=base_pad)
         local_tokens = local.tokens.detach() if detach_local else local.tokens
         local_len = local_tokens.size(1)
+        latent_pad = self._latent_pad_from_local(local)
         target_tokens = max(1, int(local_len * (1.0 - self.config.latent_merge_ratio)))
         compressed, latent_sources, group_map = self.latent_encoder.forward_with_merge(
             local_tokens,
             target_tokens=target_tokens,
+            key_padding_mask=latent_pad,
         )
         unmerged_to_L = unmerge_tokens(compressed, latent_sources, local_len)
-        decoded_local = self.latent_decoder(unmerged_to_L)
+        decoded_local = self.latent_decoder(unmerged_to_L, key_padding_mask=latent_pad)
         logits, base_repr = self.logits_from_decoded_local(
             decoded_local,
             local.sources,
             input_ids.size(1),
+            base_padding_mask=base_pad,
         )
         output = ReconstructionOutput(
             logits=logits,
@@ -226,12 +276,15 @@ class MergeDNAModel(nn.Module):
 
     def make_adaptive_mask(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, int]:
         with torch.no_grad():
-            local = self.encode_local(input_ids)
+            base_pad = self._pad_mask(input_ids)
+            local = self.encode_local(input_ids, key_padding_mask=base_pad)
             local_len = local.tokens.size(1)
+            latent_pad = self._latent_pad_from_local(local)
             target_tokens = max(1, int(local_len * (1.0 - self.config.latent_merge_ratio)))
             _, latent_sources, group_map = self.latent_encoder.forward_with_merge(
                 local.tokens,
                 target_tokens=target_tokens,
+                key_padding_mask=latent_pad,
             )
             latent_lengths = [len(batch_sources) for batch_sources in latent_sources]
             num_masks = max(1, target_tokens)
