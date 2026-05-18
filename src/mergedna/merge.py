@@ -112,8 +112,8 @@ def apply_merge_pairs(
     group_maps: list[list[int]] = []
 
     for batch_idx, pairs in enumerate(pairs_by_batch):
-        pair_lookup = {right: left for left, right in pairs}
-        skip = set(pair_lookup)
+        left_to_right: dict[int, int] = {left: right for left, right in pairs}
+        right_to_left: dict[int, int] = {right: left for left, right in pairs}
         source_batch = sources[batch_idx]
         length = tokens.size(1)
         new_tokens: list[torch.Tensor] = []
@@ -121,22 +121,25 @@ def apply_merge_pairs(
         group_map: list[int] = [-1] * length
 
         for idx in range(length):
-            if idx in skip:
+            if idx in right_to_left:
                 continue
-            if idx in pair_lookup.values():
-                right = next(right_idx for right_idx, left_idx in pair_lookup.items() if left_idx == idx)
+            out_idx = len(new_tokens)
+            if idx in left_to_right:
+                right = left_to_right[idx]
                 left_weight = len(source_batch[idx])
                 right_weight = len(source_batch[right])
                 total = left_weight + right_weight
-                token = (tokens[batch_idx, idx] * left_weight + tokens[batch_idx, right] * right_weight) / total
+                token = (
+                    tokens[batch_idx, idx] * left_weight
+                    + tokens[batch_idx, right] * right_weight
+                ) / total
                 group = sorted(source_batch[idx] + source_batch[right])
-                out_idx = len(new_tokens)
                 group_map[idx] = out_idx
                 group_map[right] = out_idx
             else:
                 token = tokens[batch_idx, idx]
                 group = list(source_batch[idx])
-                group_map[idx] = len(new_tokens)
+                group_map[idx] = out_idx
             new_tokens.append(token)
             new_sources.append(group)
 
