@@ -1,5 +1,7 @@
 # MergeDNA
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shengyongniu/mergedna/blob/main/notebooks/mergedna_colab.ipynb) [![Tests](https://github.com/shengyongniu/mergedna/actions/workflows/tests.yml/badge.svg)](https://github.com/shengyongniu/mergedna/actions/workflows/tests.yml)
+
 This repo is a compact PyTorch prototype of **MergeDNA: Context-aware Genome Modeling with Dynamic Tokenization through Token Merging**. It is meant for a take-home implementation: faithful enough to show the model structure and training objectives, small enough to run tests locally and a toy training loop on CPU or a Colab GPU.
 
 It is not a reproduction of the full paper run. The paper trains a roughly 380M parameter model with 4k-token contexts for 100k steps on 8 A100-80G GPUs. This implementation keeps the same moving parts at a much smaller scale.
@@ -67,6 +69,15 @@ Useful flags for longer runs:
 - `--num-workers 2` to overlap FASTA decoding with the training step.
 - `--checkpoint path.pt` saves the model, config, and full per-step loss history. The `results.ipynb` notebook reads the history from this file.
 
+A reasonable Colab-GPU recipe that finishes in ~10–15 min on a T4 and produces the figures in `docs/`:
+
+```bash
+python scripts/train_toy.py --fasta data/ecoli_k12_cds.fa \
+  --steps 1000 --batch-size 64 --seq-len 512 --d-model 128 \
+  --lr 5e-4 --print-every 50 --device cuda \
+  --checkpoint checkpoints/ecoli.pt
+```
+
 ## Inspect Tokenization
 
 ```bash
@@ -77,21 +88,23 @@ This prints simple token-span statistics from the local merge stack. Repetitive 
 
 ## Results
 
-The `notebooks/results.ipynb` notebook loads a checkpoint and produces the figures below from real model output. Re-run it with `--checkpoint checkpoints/your_run.pt` to refresh them after a longer training run.
+Figures below come from a 1000-step run on the E. coli K-12 CDS FASTA (`d_model=128`, `seq_len=512`, `batch=64` on a Colab T4). `notebooks/results.ipynb` regenerates them from any checkpoint produced by `train_toy.py --checkpoint ...`.
 
-**Training losses.** All three objectives decrease together; AMTM starts higher because it is a summed cross-entropy over masked bases.
+**Training losses.** MTR and latent MTR drop quickly in the first ~100 steps and then settle around 0.2–0.3. AMTM (sum over masked bases) is noisier but trends down.
 
 ![training losses](docs/loss_curve.png)
 
-**Per-sequence span distribution.** One merged token covers 1–4 bases. A fixed `k`-mer or BPE tokenizer would put all mass on a single bar; MergeDNA spreads it across span lengths in a content-dependent way.
+**Span distribution on real DNA.** One merged token covers 1–4 bases. A fixed `k`-mer tokenizer would put all mass on a single bar.
 
 ![span histogram](docs/span_histogram.png)
 
-**Span distribution by input content.** Same model applied to several inputs of equal length. The total token count is identical (the merge budget is fixed by `merge_ratio`); the shape of the distribution differs by content.
+**Span distribution by input content.** Same model applied to several 512 bp inputs. Total compression is identical by construction (the merge budget is set by `merge_ratio`); what differs is the *shape* of the distribution.
 
 ![span by content](docs/span_by_content.png)
 
-The starter figures here come from a short prototype run. Differences between repetitive, random, and real DNA are visible but modest — pair selection is non-differentiable, so the merge-key projection only gets indirect signal, and convincing content-aware behaviour needs much more training on more diverse data than a single bacterial genome.
+The clearest signal in this run: **E. coli CDS gets compressed into 2-base spans more aggressively than any synthetic input** (81 two-base tokens vs 70 random / 20 all-A / 11 CG-repeat) and has the fewest singletons (199 vs 205 / 234 / 240). Repetitive inputs lean on 3-base spans instead. The trained-vs-untrained comparison (see notebook) shows training amplifies these differences, especially at length 2.
+
+This is a modest but real content-dependent signal. The pair-selection step is non-differentiable, so `merge_key` only gets indirect supervision through the reconstruction losses; with only ~1k steps on a single bacterial genome it is unsurprising that the trained and untrained span distributions are not dramatically different. The paper's 100k+ step pretraining across multiple species is where this signal is expected to sharpen into clear semantic merging.
 
 ## How This Maps To The Paper
 
@@ -135,4 +148,4 @@ What is intentionally simpler:
 
 ## Scaling Up
 
-The defaults are deliberately small. For Colab or a larger GPU, try increasing `d_model`, `seq_len`, layer counts, batch size, and training steps in `MergeDNAConfig` and `scripts/train_toy.py`. The first bottleneck will be Python-level source tracking and repeated variable-length batching, not the Transformer blocks.
+The defaults are deliberately small. For Colab or a larger GPU, increase `d_model`, `seq_len`, layer counts, batch size, and steps. The merge ops are vectorized (one batched cosine-sim + a single device→host transfer for the greedy non-overlap pick), so the remaining bottlenecks are the Python-side source-tracking lists and the per-batch padding/`pad_sequence` round-trips, not the Transformer blocks. Moving `SourceGroups` to dense int tensors and replacing the greedy pick with a CUDA bipartite-matching kernel would be the next step toward paper-scale throughput.
