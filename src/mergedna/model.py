@@ -35,6 +35,9 @@ class MergeDNAConfig:
     local_decoder_layers: int = 1
     local_window: int = 16
     merge_ratio: float = 0.25
+    merge_ratio_jitter_std: float = 0.05
+    merge_ratio_min: float = 0.10
+    merge_ratio_max: float = 0.40
     latent_merge_ratio: float = 0.5
     latent_merge_at_layer: int | None = None
     neighbor_radius: int = 1
@@ -85,15 +88,26 @@ class LocalEncoder(nn.Module):
         self.merge_key = nn.Linear(config.d_model, config.d_model, bias=False)
         self.norm = nn.LayerNorm(config.d_model)
 
+    def _sample_merge_ratio(self) -> float:
+        cfg = self.config
+        if not self.training or cfg.merge_ratio_jitter_std <= 0.0:
+            return cfg.merge_ratio
+        sample = torch.normal(
+            mean=torch.tensor(cfg.merge_ratio),
+            std=torch.tensor(cfg.merge_ratio_jitter_std),
+        ).item()
+        return float(min(max(sample, cfg.merge_ratio_min), cfg.merge_ratio_max))
+
     def forward(self, input_ids: torch.Tensor) -> LocalEncoding:
         x = self.position(self.embedding(input_ids))
         sources = initial_sources(input_ids.size(0), input_ids.size(1))
         for layer in self.layers:
             x = layer(x)
+            merge_ratio = self._sample_merge_ratio()
             pairs = select_merge_pairs(
                 self.merge_key(x),
                 window_size=self.config.local_window,
-                merge_ratio=self.config.merge_ratio,
+                merge_ratio=merge_ratio,
                 neighbor_radius=self.config.neighbor_radius,
             )
             merge_out = apply_merge_pairs(x, sources, pairs)
