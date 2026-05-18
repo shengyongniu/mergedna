@@ -157,6 +157,7 @@ class MergeDNAModel(nn.Module):
             dropout=self.config.dropout,
             local_window=self.config.local_window,
         )
+        self.latent_position = LearnedPositionEmbedding(self.config.max_seq_len, self.config.d_model)
         self.base_position = LearnedPositionEmbedding(self.config.max_seq_len, self.config.d_model)
         self.output = nn.Linear(self.config.d_model, self.config.vocab_size)
 
@@ -177,7 +178,8 @@ class MergeDNAModel(nn.Module):
         latent_pad = (~local.valid_mask) if local.valid_mask is not None else None
         if latent_pad is not None and not bool(latent_pad.any()):
             latent_pad = None
-        return self.latent_encoder(local.tokens, key_padding_mask=latent_pad)
+        positioned = self.latent_position(local.tokens)
+        return self.latent_encoder(positioned, key_padding_mask=latent_pad)
 
     def decode_from_local_tokens(
         self,
@@ -188,7 +190,8 @@ class MergeDNAModel(nn.Module):
         latent_padding_mask: torch.Tensor | None = None,
         base_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        latent = self.latent_encoder(local_tokens, key_padding_mask=latent_padding_mask)
+        positioned = self.latent_position(local_tokens)
+        latent = self.latent_encoder(positioned, key_padding_mask=latent_padding_mask)
         decoded_local = self.latent_decoder(latent, key_padding_mask=latent_padding_mask)
         logits, base_repr = self.logits_from_decoded_local(
             decoded_local, sources, seq_len, base_padding_mask=base_padding_mask
@@ -246,8 +249,9 @@ class MergeDNAModel(nn.Module):
         local_len = local_tokens.size(1)
         latent_pad = self._latent_pad_from_local(local)
         target_tokens = max(1, int(local_len * (1.0 - self.config.latent_merge_ratio)))
+        positioned = self.latent_position(local_tokens)
         compressed, latent_sources, group_map = self.latent_encoder.forward_with_merge(
-            local_tokens,
+            positioned,
             target_tokens=target_tokens,
             key_padding_mask=latent_pad,
         )
@@ -281,8 +285,9 @@ class MergeDNAModel(nn.Module):
             local_len = local.tokens.size(1)
             latent_pad = self._latent_pad_from_local(local)
             target_tokens = max(1, int(local_len * (1.0 - self.config.latent_merge_ratio)))
+            positioned = self.latent_position(local.tokens)
             _, latent_sources, group_map = self.latent_encoder.forward_with_merge(
-                local.tokens,
+                positioned,
                 target_tokens=target_tokens,
                 key_padding_mask=latent_pad,
             )
